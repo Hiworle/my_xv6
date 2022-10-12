@@ -283,6 +283,9 @@ fork(void)
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
 
+  // inherit parent's trace mask
+  np->mask = p->mask;
+
   // increment reference counts on open file descriptors.
   for(i = 0; i < NOFILE; i++)
     if(p->ofile[i])
@@ -692,4 +695,44 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+// Set trace mask
+// Return 0, success
+int trace(int mask)
+{
+  struct proc *p = myproc();
+  p->mask = mask;
+  return 0;
+}
+
+// Get number of UNUSED process
+uint64 nproc(void)
+{
+  struct proc *p;
+  uint64 cnt = 0;
+
+  for (p = proc; p < &proc[NPROC]; p++)
+  {
+    acquire(&p->lock);
+    if (p->state == UNUSED)
+    {
+      cnt++;
+    }
+    release(&p->lock);
+  }
+  return cnt;
+}
+
+// get number of free file descriptor
+uint64 freefd(void)
+{
+  struct proc *p = myproc();
+  uint64 cnt = 0;
+  for (int fd = 0; fd < NOFILE; fd++)
+  {
+    if (p->ofile[fd] == 0)
+      cnt++;
+  }
+  return cnt;
 }
