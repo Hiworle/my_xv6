@@ -28,7 +28,6 @@ struct
 {
   struct spinlock lock[NBUCKETS];
   struct buf buf[NBUF];
-  struct spinlock lockall;
 
   // 每个桶共用lock
   struct buf buckets[NBUCKETS];
@@ -37,8 +36,6 @@ struct
 void binit(void)
 {
   struct buf *b;
-
-  initlock(&bcache.lockall, "bcache_all");
 
   for (int bid = 0; bid < NBUCKETS; bid++)
   {
