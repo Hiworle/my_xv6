@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "param.h": "c",
+        "spinlock.h": "c",
+        "sleeplock.h": "c"
+    }
+}
