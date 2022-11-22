@@ -40,6 +40,7 @@ procinit(void)
       uint64 va = KSTACK((int) (p - proc));
       kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
       p->kstack = va;
+      p->kstack_pa = (uint64)pa;
   }
   kvminithart();
 }
@@ -121,6 +122,17 @@ found:
     return 0;
   }
 
+  // An initalized kernel page table.
+  p->k_pagetable = proc_kpagetable();
+  if(p->k_pagetable == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // map kernel stack to k_pagetable
+  pkvmmap(p->k_pagetable, p->kstack, p->kstack_pa, PGSIZE, PTE_R | PTE_W);
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -141,6 +153,9 @@ freeproc(struct proc *p)
   p->trapframe = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  if(p->k_pagetable)
+    proc_freekpagetable(p->k_pagetable);
+
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -221,6 +236,9 @@ userinit(void)
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
+  // update kernel-user map
+  kumap_update(p->k_pagetable, p->pagetable);
+
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
   p->trapframe->sp = PGSIZE;  // user stack pointer
@@ -250,6 +268,8 @@ growproc(int n)
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
   p->sz = sz;
+  // update kernel-user map
+  kumap_update(p->k_pagetable, p->pagetable);
   return 0;
 }
 
@@ -273,6 +293,8 @@ fork(void)
     release(&np->lock);
     return -1;
   }
+  // update kernel-user map
+  kumap_update(np->k_pagetable, np->pagetable);
   np->sz = p->sz;
 
   np->parent = p;
@@ -473,7 +495,10 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        w_satp(MAKE_SATP(p->k_pagetable)); // switch satp register
+        sfence_vma();
         swtch(&c->context, &p->context);
+        kvminithart(); // load back global kernel pagetable
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.

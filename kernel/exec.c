@@ -116,6 +116,14 @@ exec(char *path, char **argv)
   p->trapframe->sp = sp; // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
 
+  // update kernel-user map
+  kumap_update(p->k_pagetable, p->pagetable);
+
+  // print pagetable of pid 1
+  if (p->pid == 1)
+  {
+    vmprint(p->pagetable);
+  }
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 
  bad:

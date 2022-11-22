@@ -56,6 +56,68 @@ kvminithart()
   sfence_vma();
 }
 
+/*
+ * init a new kernel page table.
+ */
+pagetable_t
+proc_kpagetable()
+{
+  pagetable_t kpagetable;
+
+  kpagetable = (pagetable_t) kalloc();
+  memset(kpagetable, 0, PGSIZE);
+
+  // uart registers
+  pkvmmap(kpagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+
+  // virtio mmio disk interface
+  pkvmmap(kpagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+
+  // do not map CLINT
+
+  // PLIC
+  pkvmmap(kpagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+
+  // map kernel text executable and read-only.
+  pkvmmap(kpagetable, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+
+  // map kernel data and the physical RAM we'll make use of.
+  pkvmmap(kpagetable, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  pkvmmap(kpagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  return kpagetable;
+}
+
+// map kernel page table kp to user page table up,
+// only map leaf PTEs from 0x0 to 0xC000000, 
+// up should not be empty
+void
+kumap_update(pagetable_t kp, pagetable_t up)
+{
+  if(!(up[0] & PTE_V))
+    panic("empty up\n");
+
+  pagetable_t kchild = (kp[0] & PTE_V) ? (pagetable_t)PTE2PA(kp[0]) : 0;
+  pagetable_t uchild = (pagetable_t)PTE2PA(up[0]);
+  if (!kchild)
+  {
+    // create kp[0]
+    kchild = (pagetable_t)kalloc();
+    kp[0] = PA2PTE(kchild) | PTE_V; // 这里是次页表，不需要置 RWX 位！！！
+  }
+
+  for (int i = 0; i < 96; i++)
+  {
+    // 一个叶子页表 512PTEs * 4096Bytes
+    // 总共有 0xC000000 / (512PTEs * 4096Bytes) = 96 个叶子页表
+    // ，即 96 个页表项，全部复制给 kp
+    kchild[i] = uchild[i];
+  }
+}
+
 // Return the address of the PTE in page table pagetable
 // that corresponds to virtual address va.  If alloc!=0,
 // create any required page-table pages.
@@ -119,6 +181,16 @@ kvmmap(uint64 va, uint64 pa, uint64 sz, int perm)
 {
   if(mappages(kernel_pagetable, va, sz, pa, perm) != 0)
     panic("kvmmap");
+}
+
+// add a mapping to the given kernel page table pagetable.
+// only used when booting.
+// does not flush TLB or enable paging.
+void
+pkvmmap(pagetable_t pagetable, uint64 va, uint64 pa, uint64 sz, int perm)
+{
+  if(mappages(pagetable, va, sz, pa, perm) != 0)
+    panic("pkvmmap");
 }
 
 // translate a kernel virtual address to
@@ -282,12 +354,44 @@ freewalk(pagetable_t pagetable)
       // this PTE points to a lower-level page table.
       uint64 child = PTE2PA(pte);
       freewalk((pagetable_t)child);
-      pagetable[i] = 0;  
+      // pagetable[i] = 0;  
     } else if(pte & PTE_V){
       panic("freewalk: leaf");
     }
   }
   kfree((void*)pagetable);
+}
+
+// Recursively free page-table pages, but **do not** free the
+// physical memory they refer to, and not free the leaf pages
+// created by user located between 0x0 to 0xC000000.
+void 
+proc_freekpagetable(pagetable_t kpagetable)
+{
+  pte_t pte;
+  pagetable_t child, leaf;
+
+  for (int i = 0; i < 512; i++)
+  {
+    pte = kpagetable[i];
+    if(!(pte & PTE_V)) continue;
+    child = (pagetable_t)PTE2PA(pte);
+    // for page 0, do not free the user leafs,
+    // 96 = 0xC000000 / (512PTEs * 4096Bytes)
+    int st = (i == 0) ? 96 : 0;
+    for (int j = st; j < 512; j++)
+    {
+      pte = child[j];
+      if (pte & PTE_V)
+      {
+        leaf = (pagetable_t)PTE2PA(pte);
+        kfree((void *)leaf);
+      }
+    }
+    kfree((void *)child);
+  }
+
+  kfree((void *)kpagetable);
 }
 
 // Free user memory pages,
@@ -337,7 +441,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 }
 
 // mark a PTE invalid for user access.
-// used by exec for the user stack guard page.
+// used by exec for the user stack  page.
 void
 uvmclear(pagetable_t pagetable, uint64 va)
 {
@@ -378,7 +482,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
 int
-copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+copyin_old(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
   uint64 n, va0, pa0;
 
@@ -399,12 +503,26 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
   return 0;
 }
 
+int
+copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+{
+  // old
+  if(srcva >= PLIC)
+    return copyin_old(pagetable, dst, srcva, len);
+  
+  // new
+  w_sstatus(r_sstatus() | SSTATUS_SUM);
+  int ret = copyin_new(pagetable, dst, srcva, len);
+  w_sstatus(r_sstatus() & ~SSTATUS_SUM);
+  return ret;
+}
+
 // Copy a null-terminated string from user to kernel.
 // Copy bytes to dst from virtual address srcva in a given page table,
 // until a '\0', or max.
 // Return 0 on success, -1 on error.
 int
-copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+copyinstr_old(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
   uint64 n, va0, pa0;
   int got_null = 0;
@@ -442,6 +560,20 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   }
 }
 
+int
+copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+{
+  // old
+  if (srcva >= PLIC)
+    return copyinstr_old(pagetable, dst, srcva, max);
+  
+  // new
+  w_sstatus(r_sstatus() | SSTATUS_SUM);
+  int ret = copyinstr_new(pagetable, dst, srcva, max);
+  w_sstatus(r_sstatus() & ~SSTATUS_SUM);
+  return ret;
+}
+
 // check if use global kpgtbl or not 
 int 
 test_pagetable()
@@ -449,4 +581,46 @@ test_pagetable()
   uint64 satp = r_satp();
   uint64 gsatp = MAKE_SATP(kernel_pagetable);
   return satp != gsatp;
+}
+
+// 打印页目录
+// pgtbl：页目录
+// layer：页目录在第几层，例如：第0层就是根页目录。
+void vmprint_page(pagetable_t pgtbl, uint layer)
+{
+  // 指向非页目录
+  if (layer > 2)
+    return;
+  // 512 PTEs in one page
+  for (int i = 0; i < 512; i++)
+  {
+    pte_t pte = pgtbl[i];
+    if (pte & PTE_V)
+    {
+      // pgtbl是页目录，PTE 指向更低级页表或物理页
+      switch (layer)
+      {
+      case 2:
+        printf("|| ");
+      case 1:
+        printf("|| ");
+      case 0:
+        printf("||%d: pte %p pa %p\n", i, pte, PTE2PA(pte));
+        break;
+      default:
+        panic("bad layer");
+      }
+
+      uint64 child = PTE2PA(pte);
+      vmprint_page((pagetable_t)child, layer + 1);
+    }
+  }
+}
+
+// 打印页表 pgtbl 的所有有效项，递归地打印有效项目对应
+// 页表的有效项目，pgtbl 应为根页目录
+void vmprint(pagetable_t pgtbl)
+{
+  printf("page table %p\n", pgtbl);
+  vmprint_page(pgtbl, 0);
 }
